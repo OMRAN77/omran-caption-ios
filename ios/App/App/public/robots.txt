@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://omran-caption.vercel.app/sitemap.xml

@@ -1,0 +1,662 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Omran Caption</title>
+<meta name="description" content="ترجمة نصوص حية فورية للصوت + ترجمة لأي لغة - by عمران" />
+<meta name="theme-color" content="#1a73e8" />
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+<link rel="icon" href="icons/favicon-32.png" />
+<style>
+  :root{
+    --bg:#0b0c10;
+    --panel:#16181d;
+    --panel2:#1e2127;
+    --border:#2a2d34;
+    --text:#e8eaed;
+    --muted:#9aa0a6;
+    --accent:#1a73e8;
+    --accent2:#8ab4f8;
+    --danger:#ea4335;
+    --gold:#fbbc04;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:"Segoe UI",Tahoma,"Cairo",system-ui,sans-serif;
+    display:flex;
+    flex-direction:column;
+    min-height:100vh;
+  }
+  [dir="ltr"] body{font-family:"Segoe UI",system-ui,sans-serif;}
+
+  #bgCanvas{
+    position:fixed;
+    inset:0;
+    width:100%;
+    height:100%;
+    z-index:0;
+    display:block;
+    background:radial-gradient(ellipse at 50% 20%,#101823 0%,#0b0c10 60%);
+  }
+  header, main, footer{position:relative;z-index:1;}
+  header{background:rgba(22,24,29,.72);backdrop-filter:blur(6px);}
+  .cc-stage, .selector-box, .usage-note{backdrop-filter:blur(2px);}
+
+  header{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    padding:12px 16px;
+    border-bottom:1px solid var(--border);
+    background:var(--panel);
+    position:sticky;
+    top:0;
+    z-index:10;
+  }
+  .brand{display:flex;align-items:center;gap:10px;}
+  .brand .cc{
+    width:34px;height:34px;border-radius:8px;
+    background:var(--accent);
+    display:flex;align-items:center;justify-content:center;
+    font-weight:800;font-size:14px;color:#fff;letter-spacing:-1px;
+  }
+  .brand-name{font-weight:700;font-size:16px;}
+  .brand-name small{display:block;font-weight:400;font-size:11px;color:var(--muted);}
+
+  .header-actions{display:flex;align-items:center;gap:8px;}
+  .lang-toggle{
+    display:flex;border:1px solid var(--border);border-radius:20px;overflow:hidden;
+  }
+  .lang-toggle button{
+    background:transparent;border:none;color:var(--muted);padding:6px 12px;font-size:12px;cursor:pointer;
+  }
+  .lang-toggle button.active{background:var(--accent);color:#fff;}
+
+  .premium-btn{
+    background:linear-gradient(135deg,var(--gold),#f29900);
+    color:#1a1a1a;border:none;border-radius:20px;
+    padding:7px 16px;font-weight:700;font-size:12.5px;cursor:pointer;
+    display:flex;align-items:center;gap:6px;
+    box-shadow:0 2px 8px rgba(251,188,4,.3);
+  }
+  .premium-btn:hover{filter:brightness(1.05);}
+
+  main{
+    flex:1;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    padding:24px 16px 32px;
+    gap:22px;
+    max-width:720px;
+    width:100%;
+    margin:0 auto;
+  }
+
+  .selectors{
+    width:100%;
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:12px;
+  }
+  .selector-box{
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:14px;
+    padding:10px 12px;
+  }
+  .selector-box label{
+    display:block;font-size:11px;color:var(--muted);margin-bottom:6px;font-weight:600;
+  }
+  .selector-box select{
+    width:100%;background:var(--panel2);color:var(--text);border:1px solid var(--border);
+    border-radius:10px;padding:9px 10px;font-size:13.5px;outline:none;cursor:pointer;
+  }
+  .selector-box select:focus{border-color:var(--accent);}
+
+  .swap-btn{
+    align-self:center;
+    background:var(--panel2);border:1px solid var(--border);color:var(--accent2);
+    width:34px;height:34px;border-radius:50%;cursor:pointer;font-size:15px;
+    display:flex;align-items:center;justify-content:center;margin:-6px auto 0;
+  }
+
+  .cc-stage{
+    width:100%;
+    min-height:180px;
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:18px;
+    padding:20px;
+    display:flex;
+    flex-direction:column;
+    justify-content:center;
+    gap:10px;
+    position:relative;
+  }
+  .cc-stage.idle{align-items:center;justify-content:center;color:var(--muted);font-size:14px;text-align:center;}
+  .cc-line{
+    font-size:20px;
+    line-height:1.5;
+    font-weight:500;
+  }
+  .cc-line.original{color:var(--muted);font-size:14px;}
+  .cc-line.translated{color:var(--text);font-size:22px;font-weight:600;}
+  .cc-badge{
+    position:absolute;top:10px;inset-inline-end:14px;
+    font-size:10px;color:var(--muted);
+    display:flex;align-items:center;gap:5px;
+  }
+  .cc-badge .dot{width:7px;height:7px;border-radius:50%;background:var(--danger);animation:pulse 1.2s infinite;}
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.3;}}
+
+  .main-btn-wrap{display:flex;flex-direction:column;align-items:center;gap:14px;margin-top:6px;}
+  .main-btn{
+    width:96px;height:96px;border-radius:50%;
+    background:var(--accent);
+    border:none;color:#fff;font-size:34px;
+    display:flex;align-items:center;justify-content:center;
+    cursor:pointer;box-shadow:0 4px 20px rgba(26,115,232,.4);
+    transition:transform .15s, background .2s;
+  }
+  .main-btn:active{transform:scale(.94);}
+  .main-btn.recording{
+    background:var(--danger);
+    box-shadow:0 0 0 8px rgba(234,67,53,.15), 0 4px 20px rgba(234,67,53,.4);
+    animation:ring 1.4s infinite;
+  }
+  @keyframes ring{
+    0%{box-shadow:0 0 0 0 rgba(234,67,53,.35), 0 4px 20px rgba(234,67,53,.4);}
+    70%{box-shadow:0 0 0 14px rgba(234,67,53,0), 0 4px 20px rgba(234,67,53,.4);}
+    100%{box-shadow:0 0 0 0 rgba(234,67,53,0), 0 4px 20px rgba(234,67,53,.4);}
+  }
+  .main-btn-label{font-size:13.5px;color:var(--muted);font-weight:600;}
+
+  .usage-note{font-size:11.5px;color:var(--muted);text-align:center;}
+  .install-row{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;}
+  .ghost-btn{
+    background:transparent;border:1px solid var(--border);color:var(--text);
+    border-radius:10px;padding:8px 14px;font-size:12.5px;cursor:pointer;
+  }
+  .ghost-btn:hover{border-color:var(--accent);color:var(--accent2);}
+
+  footer{
+    text-align:center;padding:14px;color:var(--muted);font-size:11.5px;border-top:1px solid var(--border);
+    background:rgba(22,24,29,.6);backdrop-filter:blur(6px);
+  }
+  footer b{color:var(--text);}
+
+  .toast{
+    position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+    background:var(--panel2);border:1px solid var(--border);color:var(--text);
+    padding:10px 18px;border-radius:10px;font-size:13px;z-index:50;
+    box-shadow:0 6px 24px rgba(0,0,0,.4);
+    max-width:90vw;text-align:center;
+  }
+
+  @media (max-width:520px){
+    .selectors{grid-template-columns:1fr;}
+    .swap-btn{transform:rotate(90deg);margin:0 auto;}
+    .cc-line.translated{font-size:19px;}
+  }
+</style>
+</head>
+<body>
+
+<canvas id="bgCanvas"></canvas>
+
+<header>
+  <div class="brand">
+    <div class="cc">CC</div>
+    <div class="brand-name" id="brandName">Omran Caption<small id="brandTag">ترجمة حية فورية - by عمران</small></div>
+  </div>
+  <div class="header-actions">
+    <div class="lang-toggle">
+      <button id="uiArBtn" class="active">ARB</button>
+      <button id="uiEnBtn">ENG</button>
+    </div>
+    <button class="premium-btn" id="premiumBtn">⭐ <span id="premiumLabel">Go Premium</span></button>
+  </div>
+</header>
+
+<main>
+  <div class="selectors">
+    <div class="selector-box">
+      <label id="lblSource">🎙️ لغة التحدث (Captioning language)</label>
+      <select id="sourceLang"></select>
+    </div>
+    <div class="selector-box">
+      <label id="lblTarget">🌐 لغة الترجمة (Translation language)</label>
+      <select id="targetLang"></select>
+    </div>
+  </div>
+
+  <button class="swap-btn" id="swapBtn" title="تبديل">⇄</button>
+
+  <div class="cc-stage idle" id="ccStage">
+    <span id="ccIdleText">اضغط الزر أدناه لبدء الترجمة الحية / Press the button below to start live captioning</span>
+  </div>
+
+  <div class="main-btn-wrap">
+    <button class="main-btn" id="mainBtn">🎤</button>
+    <div class="main-btn-label" id="mainBtnLabel">اضغط لبدء الترجمة الحية / Click to Live Caption</div>
+  </div>
+
+  <div class="usage-note" id="usageNote"></div>
+
+  <div class="install-row">
+    <button class="ghost-btn" id="installBtn" style="display:none;">📲 تثبيت التطبيق / Install App</button>
+  </div>
+</main>
+
+<footer>
+  <b>Omran Caption</b> — ترجمة حية فورية لكل اللغات · by عمران
+</footer>
+
+<script>
+(function(){
+  const LANGS = [
+    ["auto","تلقائي / Auto Detect"],["ar","العربية / Arabic"],["en","English"],["fr","Français / French"],
+    ["es","Español / Spanish"],["de","Deutsch / German"],["it","Italiano / Italian"],["pt","Português / Portuguese"],
+    ["ru","Русский / Russian"],["zh","中文 / Chinese"],["ja","日本語 / Japanese"],["ko","한국어 / Korean"],
+    ["hi","हिन्दी / Hindi"],["ur","اردو / Urdu"],["fa","فارسی / Persian"],["tr","Türkçe / Turkish"],
+    ["nl","Nederlands / Dutch"],["pl","Polski / Polish"],["sv","Svenska / Swedish"],["el","Ελληνικά / Greek"],
+    ["he","עברית / Hebrew"],["th","ไทย / Thai"],["vi","Tiếng Việt / Vietnamese"],["id","Indonesia"],
+    ["ms","Melayu / Malay"],["bn","বাংলা / Bengali"],["ta","தமிழ் / Tamil"],["ml","മലയാളം / Malayalam"],
+    ["ku","کوردی / Kurdish"],["sw","Kiswahili / Swahili"],["am","አማርኛ / Amharic"],["uk","Українська / Ukrainian"],
+    ["ro","Română / Romanian"],["hu","Magyar / Hungarian"],["cs","Čeština / Czech"],["fi","Suomi / Finnish"],
+    ["da","Dansk / Danish"],["no","Norsk / Norwegian"],["sk","Slovenčina / Slovak"],["bg","Български / Bulgarian"],
+    ["sr","Српски / Serbian"],["hr","Hrvatski / Croatian"],["lt","Lietuvių / Lithuanian"],["lv","Latviešu / Latvian"],
+    ["et","Eesti / Estonian"],["az","Azərbaycan / Azerbaijani"],["ka","ქართული / Georgian"],["hy","Հայերեն / Armenian"],
+    ["km","ខ្មែរ / Khmer"],["lo","ລາວ / Lao"],["my","မြန်မာ / Burmese"],["ne","नेपाली / Nepali"],
+    ["si","සිංහල / Sinhala"],["ps","پښتو / Pashto"],["so","Soomaali / Somali"],["ha","Hausa"],
+    ["yo","Yorùbá / Yoruba"],["zu","isiZulu / Zulu"],["af","Afrikaans"],["sq","Shqip / Albanian"],
+    ["mk","Македонски / Macedonian"],["mn","Монгол / Mongolian"],["tl","Filipino"],
+  ];
+  // Target list should not include "auto" (need a concrete target language).
+  const TARGET_LANGS = LANGS.filter(([c]) => c !== 'auto');
+
+  const $ = (id) => document.getElementById(id);
+  const sourceSel = $('sourceLang');
+  const targetSel = $('targetLang');
+  const mainBtn = $('mainBtn');
+  const mainBtnLabel = $('mainBtnLabel');
+  const ccStage = $('ccStage');
+  const usageNote = $('usageNote');
+
+  function fillSelect(sel, list, def){
+    sel.innerHTML = '';
+    list.forEach(([code, label]) => {
+      const opt = document.createElement('option');
+      opt.value = code; opt.textContent = label;
+      if (code === def) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  }
+  fillSelect(sourceSel, LANGS, 'auto');
+  fillSelect(targetSel, TARGET_LANGS, 'en');
+
+  const savedSrc = localStorage.getItem('oc_sourceLang');
+  const savedTgt = localStorage.getItem('oc_targetLang');
+  if (savedSrc) sourceSel.value = savedSrc;
+  if (savedTgt) targetSel.value = savedTgt;
+  sourceSel.addEventListener('change', () => localStorage.setItem('oc_sourceLang', sourceSel.value));
+  targetSel.addEventListener('change', () => localStorage.setItem('oc_targetLang', targetSel.value));
+
+  $('swapBtn').addEventListener('click', () => {
+    const s = sourceSel.value === 'auto' ? 'en' : sourceSel.value;
+    const t = targetSel.value;
+    if (LANGS.some(([c]) => c === t)) sourceSel.value = t;
+    targetSel.value = s;
+    localStorage.setItem('oc_sourceLang', sourceSel.value);
+    localStorage.setItem('oc_targetLang', targetSel.value);
+  });
+
+  // ---------------- UI language (interface only, AR/EN) ----------------
+  const UI_TEXT = {
+    ar: {
+      brandTag: 'ترجمة حية فورية - by عمران',
+      lblSource: '🎙️ لغة التحدث (Captioning language)',
+      lblTarget: '🌐 لغة الترجمة (Translation language)',
+      ccIdle: 'اضغط الزر أدناه لبدء الترجمة الحية / Press the button below to start live captioning',
+      mainBtnLabel: 'اضغط لبدء الترجمة الحية / Click to Live Caption',
+      mainBtnLabelStop: 'اضغط للإيقاف / Click to stop',
+      premium: 'اشترك الآن',
+      install: '📲 تثبيت التطبيق',
+      micDenied: 'تم رفض إذن الميكروفون. فعّله من إعدادات المتصفح.',
+    },
+    en: {
+      brandTag: 'Live captioning & translation - by Omran',
+      lblSource: '🎙️ Captioning language',
+      lblTarget: '🌐 Translation language',
+      ccIdle: 'Press the button below to start live captioning',
+      mainBtnLabel: 'Click to Live Caption',
+      mainBtnLabelStop: 'Click to stop',
+      premium: 'Go Premium',
+      install: '📲 Install App',
+      micDenied: 'Microphone permission denied. Enable it in your browser settings.',
+    },
+  };
+  let uiLang = localStorage.getItem('oc_uiLang') || 'ar';
+
+  function applyUiLang(){
+    const t = UI_TEXT[uiLang];
+    document.documentElement.lang = uiLang;
+    document.documentElement.dir = uiLang === 'ar' ? 'rtl' : 'ltr';
+    $('brandTag').textContent = t.brandTag;
+    $('lblSource').textContent = t.lblSource;
+    $('lblTarget').textContent = t.lblTarget;
+    if (!recording) $('ccIdleText').textContent = t.ccIdle;
+    mainBtnLabel.textContent = recording ? t.mainBtnLabelStop : t.mainBtnLabel;
+    $('premiumLabel').textContent = t.premium;
+    $('installBtn').textContent = t.install;
+    $('uiArBtn').classList.toggle('active', uiLang === 'ar');
+    $('uiEnBtn').classList.toggle('active', uiLang === 'en');
+  }
+  $('uiArBtn').addEventListener('click', () => { uiLang = 'ar'; localStorage.setItem('oc_uiLang','ar'); applyUiLang(); });
+  $('uiEnBtn').addEventListener('click', () => { uiLang = 'en'; localStorage.setItem('oc_uiLang','en'); applyUiLang(); });
+
+  // ---------------- Guest id ----------------
+  function genId(){ return 'g_' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
+  let guestId = localStorage.getItem('oc_guestId');
+  if (!guestId) { guestId = genId(); localStorage.setItem('oc_guestId', guestId); }
+
+  // ---------------- Recording ----------------
+  let recording = false;
+  let mediaStream = null;
+  let mediaRecorder = null;
+  let chunkTimer = null;
+  let stopping = false;
+  const CHUNK_MS = 3500;
+
+  function showToast(msg, ms){
+    const el = document.createElement('div');
+    el.className = 'toast';
+    el.textContent = msg;
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), ms || 4000);
+  }
+
+  function pickMime(){
+    const candidates = ['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg;codecs=opus'];
+    for (const c of candidates){
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(c)) return c;
+    }
+    return '';
+  }
+
+  function blobToBase64(blob){
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(String(reader.result).split(',')[1] || '');
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function setStageLines(original, translated){
+    ccStage.classList.remove('idle');
+    ccStage.innerHTML =
+      '<span class="cc-badge"><span class="dot"></span>LIVE</span>' +
+      (original ? '<div class="cc-line original">' + escapeHtml(original) + '</div>' : '') +
+      '<div class="cc-line translated">' + escapeHtml(translated || '…') + '</div>';
+  }
+
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  async function sendChunk(blob, mimeType){
+    try {
+      const audioBase64 = await blobToBase64(blob);
+      if (!audioBase64) return;
+      const resp = await fetch('/api/caption', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          audioBase64, mimeType,
+          sourceLang: sourceSel.value,
+          targetLang: targetSel.value,
+          guestId,
+        }),
+      });
+      if (resp.status === 402) {
+        const data = await resp.json().catch(() => ({}));
+        showToast(data.error || 'Daily limit reached.', 6000);
+        stopRecording();
+        return;
+      }
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({}));
+        if (resp.status !== 429) console.warn('caption error', data);
+        return;
+      }
+      const data = await resp.json();
+      if (data.original || data.translated) {
+        setStageLines(data.original, data.translated);
+      }
+    } catch (e) {
+      // transient network hiccup; keep loop alive
+    }
+  }
+
+  async function recordLoop(){
+    if (!recording) return;
+    try {
+      const mimeType = pickMime();
+      const recorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : undefined);
+      mediaRecorder = recorder;
+      const chunks = [];
+      recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+      recorder.onstop = () => {
+        const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
+        sendChunk(blob, mimeType || 'audio/webm');
+        if (recording) recordLoop();
+      };
+      recorder.start();
+      chunkTimer = setTimeout(() => { try { recorder.stop(); } catch(e){} }, CHUNK_MS);
+    } catch (e) {
+      showToast('Recorder error: ' + e.message, 4000);
+    }
+  }
+
+  // Watchdog: if the recorder ever gets stuck (no onstop fired within 2x
+  // the chunk duration), force-restart the loop so captioning never freezes.
+  let lastLoopAt = Date.now();
+  setInterval(() => {
+    if (!recording) return;
+    if (Date.now() - lastLoopAt > CHUNK_MS * 3) {
+      lastLoopAt = Date.now();
+      try { if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop(); } catch(e){}
+      recordLoop();
+    }
+  }, 2000);
+
+  const _origRecordLoop = recordLoop;
+  recordLoop = function(){ lastLoopAt = Date.now(); return _origRecordLoop(); };
+
+  async function startRecording(){
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      showToast(UI_TEXT[uiLang].micDenied, 5000);
+      return;
+    }
+    recording = true;
+    mainBtn.classList.add('recording');
+    mainBtn.textContent = '⏹️';
+    mainBtnLabel.textContent = UI_TEXT[uiLang].mainBtnLabelStop;
+    ccStage.classList.remove('idle');
+    ccStage.innerHTML = '<span class="cc-badge"><span class="dot"></span>LIVE</span><div class="cc-line translated">…</div>';
+    recordLoop();
+  }
+
+  function stopRecording(){
+    recording = false;
+    if (chunkTimer) clearTimeout(chunkTimer);
+    try { if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop(); } catch(e){}
+    if (mediaStream) { mediaStream.getTracks().forEach((t) => t.stop()); mediaStream = null; }
+    mainBtn.classList.remove('recording');
+    mainBtn.textContent = '🎤';
+    mainBtnLabel.textContent = UI_TEXT[uiLang].mainBtnLabel;
+    ccStage.classList.add('idle');
+    ccStage.innerHTML = '<span id="ccIdleText">' + UI_TEXT[uiLang].ccIdle + '</span>';
+  }
+
+  mainBtn.addEventListener('click', () => {
+    if (recording) stopRecording(); else startRecording();
+  });
+
+  // ---------------- Go Premium (placeholder) ----------------
+  $('premiumBtn').addEventListener('click', () => {
+    showToast(uiLang === 'ar' ? 'خطط الاشتراك قريبًا! 🚀' : 'Premium plans coming soon! 🚀', 3500);
+  });
+
+  // ---------------- PWA install ----------------
+  let deferredPrompt = null;
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredPrompt = e;
+    $('installBtn').style.display = 'inline-flex';
+  });
+  $('installBtn').addEventListener('click', async () => {
+    if (!deferredPrompt) return;
+    deferredPrompt.prompt();
+    await deferredPrompt.userChoice;
+    deferredPrompt = null;
+    $('installBtn').style.display = 'none';
+  });
+
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js').catch(() => {});
+    });
+  }
+
+  applyUiLang();
+})();
+</script>
+<script>
+(function(){
+  var canvas = document.getElementById('bgCanvas');
+  var ctx = canvas.getContext('2d');
+  var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var W=0,H=0,DPR=Math.min(window.devicePixelRatio||1,2);
+
+  function resize(){
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W*DPR; canvas.height = H*DPR;
+    canvas.style.width = W+'px'; canvas.style.height = H+'px';
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // Floating multilingual glyphs with pseudo-3D depth (parallax by z)
+  var chars = ['A','ا','文','अ','ب','あ','ن','ر','ی','ま','ह','ت','ी','ラ','ñ','Ω'];
+  var particles = [];
+  var count = Math.max(14, Math.min(34, Math.floor((W*H)/45000)));
+  function makeParticle(){
+    return {
+      x: Math.random()*W,
+      y: Math.random()*H,
+      z: 0.3 + Math.random()*0.9, // depth: smaller = farther
+      ch: chars[Math.floor(Math.random()*chars.length)],
+      vy: 0.15 + Math.random()*0.35,
+      drift: (Math.random()-0.5)*0.3,
+      rot: Math.random()*Math.PI*2,
+      vr: (Math.random()-0.5)*0.01
+    };
+  }
+  for(var i=0;i<count;i++) particles.push(makeParticle());
+
+  // Waveform bars (simulated audio waveform, bottom of screen)
+  var barCount = 48;
+  var bars = [];
+  for(var b=0;b<barCount;b++) bars.push(Math.random());
+
+  var t = 0;
+
+  function drawWave(baseY, amp, hue, alpha, speed){
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    var gap = W/barCount;
+    for(var i=0;i<barCount;i++){
+      var phase = t*speed + i*0.35;
+      var h = (Math.sin(phase) * 0.5 + 0.5) * amp * (0.4+bars[i]*0.6) + 6;
+      var x = i*gap;
+      var grad = ctx.createLinearGradient(0, baseY-h, 0, baseY+h);
+      grad.addColorStop(0, 'hsla('+hue+',85%,65%,0)');
+      grad.addColorStop(0.5, 'hsla('+hue+',85%,65%,1)');
+      grad.addColorStop(1, 'hsla('+hue+',85%,65%,0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(x, baseY-h, gap*0.6, h*2);
+    }
+    ctx.restore();
+  }
+
+  function frame(){
+    t += 0.016;
+    ctx.clearRect(0,0,W,H);
+
+    // subtle 3D grid horizon (perspective floor)
+    ctx.save();
+    ctx.globalAlpha = 0.10;
+    ctx.strokeStyle = '#1a73e8';
+    var horizon = H*0.62;
+    for(var g=1; g<=10; g++){
+      var yy = horizon + (H-horizon) * (g/10) * (g/10);
+      ctx.beginPath();
+      ctx.moveTo(0, yy);
+      ctx.lineTo(W, yy);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // floating multilingual glyphs (pseudo-3D via depth z)
+    for(var p=0;p<particles.length;p++){
+      var pt = particles[p];
+      pt.y -= pt.vy * pt.z;
+      pt.x += pt.drift * pt.z;
+      pt.rot += pt.vr;
+      if(pt.y < -40){ pt.y = H+40; pt.x = Math.random()*W; }
+      if(pt.x < -40) pt.x = W+40;
+      if(pt.x > W+40) pt.x = -40;
+
+      var size = 14 + pt.z*26;
+      ctx.save();
+      ctx.translate(pt.x, pt.y);
+      ctx.rotate(pt.rot);
+      ctx.globalAlpha = 0.08 + pt.z*0.22;
+      ctx.font = '600 '+size+'px system-ui,sans-serif';
+      ctx.fillStyle = pt.z>0.7 ? '#8ab4f8' : '#fbbc04';
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText(pt.ch, 0, 0);
+      ctx.restore();
+    }
+
+    // dual-tone waveform representing voice + translation
+    drawWave(H*0.78, 46, 214, 0.85, 1.6);
+    drawWave(H*0.86, 30, 44, 0.55, 2.1);
+
+    if(!reduceMotion) requestAnimationFrame(frame);
+  }
+
+  if(reduceMotion){
+    frame(); // draw one static frame only
+  } else {
+    requestAnimationFrame(frame);
+    document.addEventListener('visibilitychange', function(){
+      if(!document.hidden) requestAnimationFrame(frame);
+    });
+  }
+})();
+</script>
+</body>
+</html>
