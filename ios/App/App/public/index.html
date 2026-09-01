@@ -261,6 +261,10 @@
 
 <script>
 (function(){
+  // v-api-base: داخل تطبيق iOS (Capacitor) تُحمَّل الصفحة من capacitor://localhost
+  // فلا يوجد خادم محلي؛ الطلب النسبي /api/caption يفشل صامتًا وتتعطّل الترجمة.
+  // نوجّه الطلبات إلى خادم الإنتاج عند عدم كون البروتوكول http(s).
+  const API_BASE = /^https?:$/.test(location.protocol) ? '' : 'https://omran-caption.vercel.app';
   const LANGS = [
     ["auto","تلقائي / Auto Detect"],["ar","العربية / Arabic"],["en","English"],["fr","Français / French"],
     ["es","Español / Spanish"],["de","Deutsch / German"],["it","Italiano / Italian"],["pt","Português / Portuguese"],
@@ -416,7 +420,7 @@
     try {
       const audioBase64 = await blobToBase64(blob);
       if (!audioBase64) return;
-      const resp = await fetch('/api/caption', {
+      const resp = await fetch(API_BASE + '/api/caption', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -438,7 +442,11 @@
         return;
       }
       const data = await resp.json();
-      if (data.original || data.translated) {
+      // v-show-err: نعرض سبب فشل الترجمة إن وُجد بدل تجاهله (كان السيرفر
+      // يرسله والعميل يهمله فيبدو النص عالقًا بلا تفسير).
+      if (data.translationError) {
+        setStageLines(data.original, '⚠️ ' + data.translationError);
+      } else if (data.original || data.translated) {
         setStageLines(data.original, data.translated);
       }
     } catch (e) {
