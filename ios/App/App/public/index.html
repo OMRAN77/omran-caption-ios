@@ -372,12 +372,22 @@
   if (!guestId) { guestId = genId(); localStorage.setItem('oc_guestId', guestId); }
 
   // ---------------- Recording ----------------
+  // v-keep-open: التسجيل يبقى مفتوحًا حتى يضغط المستخدم إيقاف:
+  //  - إذا انقطع الميكروفون (مكالمة، Siri، تطبيق آخر، قفل الشاشة) نعيد فتحه تلقائيًا
+  //    بدل أن يبقى الزر أحمر والترجمة متوقفة صامتًا.
+  //  - الشاشة تبقى مضاءة أثناء التسجيل (Wake Lock على الويب + idle timer في iOS).
+  //  - حلقة تسجيل واحدة فقط (الـ watchdog كان يشغّل حلقة ثانية موازية).
   let recording = false;
+  let session = 0;          // يزيد مع كل تشغيل/إيقاف؛ أي callback قديم يُتجاهل
   let mediaStream = null;
   let mediaRecorder = null;
   let chunkTimer = null;
-  let stopping = false;
+  let reopening = false;
+  let lastLoopAt = 0;
+  let chunkSeq = 0;         // ترتيب المقاطع المرسلة
+  let shownSeq = 0;         // آخر مقطع عُرض (لا نعرض ردًا أقدم فوق أحدث)
   const CHUNK_MS = 3500;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   function showToast(msg, ms){
     const el = document.createElement('div');
@@ -416,10 +426,12 @@
     return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
 
-  async function sendChunk(blob, mimeType){
+  async function sendChunk(blob, mimeType, mySession){
+    const seq = ++chunkSeq;
+    const stale = () => !recording || mySession !== session || seq < shownSeq;
     try {
       const audioBase64 = await blobToBase64(blob);
-      if (!audioBase64) return;
+      if (!audioBase64 || mySession !== session) return;
       const resp = await fetch(API_BASE + '/api/caption', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -432,6 +444,7 @@
       });
       if (resp.status === 402) {
         const data = await resp.json().catch(() => ({}));
+        if (mySession !== session) return;
         showToast(data.error || 'Daily limit reached.', 6000);
         stopRecording();
         return;
@@ -442,6 +455,9 @@
         return;
       }
       const data = await resp.json();
+      // الرد وصل بعد الإيقاف أو بعد رد أحدث منه: لا نكتب فوق الشاشة.
+      if (stale()) return;
+      shownSeq = seq;
       // v-show-err: نعرض سبب فشل الترجمة إن وُجد بدل تجاهله (كان السيرفر
       // يرسله والعميل يهمله فيبدو النص عالقًا بلا تفسير).
       if (data.translationError) {
@@ -454,62 +470,169 @@
     }
   }
 
-  async function recordLoop(){
-    if (!recording) return;
+  function streamAlive(){
+    return !!mediaStream && mediaStream.getAudioTracks().some((t) => t.readyState === 'live');
+  }
+
+  async function openMic(){
+    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // 'ended' = انقطاع من خارج التطبيق (مكالمة، Siri، تطبيق آخر أخذ الميكروفون).
+    // إيقافنا نحن عبر track.stop() لا يطلق هذا الحدث.
+    s.getAudioTracks().forEach((t) => t.addEventListener('ended', () => {
+      if (recording && mediaStream === s) reopenMic();
+    }));
+    return s;
+  }
+
+  function releaseMic(){
+    if (mediaStream) mediaStream.getTracks().forEach((t) => { try { t.stop(); } catch(e){} });
+    mediaStream = null;
+  }
+
+  // يعيد فتح الميكروفون بمحاولات متكررة حتى ينجح أو يضغط المستخدم إيقاف.
+  async function reopenMic(){
+    if (!recording || reopening) return;
+    reopening = true;
+    const mySession = session;
+    const old = mediaRecorder; mediaRecorder = null;
+    if (chunkTimer) clearTimeout(chunkTimer);
+    try { if (old && old.state !== 'inactive') old.stop(); } catch(e){}
+    releaseMic();
+    let delay = 500;
     try {
-      const mimeType = pickMime();
-      const recorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : undefined);
+      while (recording && mySession === session) {
+        // في الخلفية لا يعطي iOS الميكروفون؛ نكمل عند الرجوع (visibilitychange).
+        if (document.hidden) return;
+        try {
+          const s = await openMic();
+          if (!recording || mySession !== session) { s.getTracks().forEach((t) => t.stop()); return; }
+          mediaStream = s;
+          break;
+        } catch (e) {
+          if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) {
+            showToast(UI_TEXT[uiLang].micDenied, 5000);
+            stopRecording();
+            return;
+          }
+          await sleep(delay);
+          delay = Math.min(delay * 2, 8000);
+        }
+      }
+    } finally {
+      reopening = false;
+    }
+    if (recording && mySession === session && mediaStream) recordLoop();
+  }
+
+  function recordLoop(){
+    if (!recording) return;
+    lastLoopAt = Date.now();
+    if (!streamAlive()) { reopenMic(); return; }
+    const mySession = session;
+    const mimeType = pickMime();
+    let recorder;
+    try {
+      recorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : undefined);
       mediaRecorder = recorder;
       const chunks = [];
       recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
       recorder.onstop = () => {
-        const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
-        sendChunk(blob, mimeType || 'audio/webm');
-        if (recording) recordLoop();
+        // مقطع صامت لأن iOS كتم الميكروفون (مكالمة/خلفية): لا نرسله ولا نستهلك الحد اليومي.
+        const muted = !mediaStream || mediaStream.getAudioTracks().every((t) => t.muted);
+        if (mySession === session && chunks.length && !muted) {
+          const type = mimeType || recorder.mimeType || 'audio/webm';
+          sendChunk(new Blob(chunks, { type }), type, mySession);
+        }
+        // نكمل فقط إذا كان هذا المسجّل هو الحالي — يمنع تشغيل حلقتين بالتوازي.
+        if (recording && mySession === session && recorder === mediaRecorder) recordLoop();
       };
+      recorder.onerror = () => { try { if (recorder.state !== 'inactive') recorder.stop(); } catch(e){} };
       recorder.start();
-      chunkTimer = setTimeout(() => { try { recorder.stop(); } catch(e){} }, CHUNK_MS);
     } catch (e) {
-      showToast('Recorder error: ' + e.message, 4000);
+      if (mediaRecorder === recorder) mediaRecorder = null;
+      reopenMic();
+      return;
     }
+    chunkTimer = setTimeout(() => { try { if (recorder.state !== 'inactive') recorder.stop(); } catch(e){} }, CHUNK_MS);
   }
 
-  // Watchdog: if the recorder ever gets stuck (no onstop fired within 2x
-  // the chunk duration), force-restart the loop so captioning never freezes.
-  let lastLoopAt = Date.now();
-  setInterval(() => {
-    if (!recording) return;
+  // فحص دوري + عند الرجوع للتطبيق: يعيد الميكروفون أو الحلقة إن تعطّلت،
+  // فلا يبقى الزر أحمر والترجمة متوقفة.
+  let mutedSince = 0;
+  function checkHealth(){
+    if (!recording || reopening || document.hidden) return;
+    if (!streamAlive()) { reopenMic(); return; }
+    const muted = mediaStream.getAudioTracks().every((t) => t.muted);
+    mutedSince = muted ? (mutedSince || Date.now()) : 0;
+    if (muted && Date.now() - mutedSince > 8000) { mutedSince = 0; reopenMic(); return; }
     if (Date.now() - lastLoopAt > CHUNK_MS * 3) {
-      lastLoopAt = Date.now();
-      try { if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop(); } catch(e){}
+      const stuck = mediaRecorder; mediaRecorder = null;
+      try { if (stuck && stuck.state !== 'inactive') stuck.stop(); } catch(e){}
       recordLoop();
     }
-  }, 2000);
+  }
+  setInterval(checkHealth, 2000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden || !recording) return;
+    keepScreenOn(true); // المتصفح يحرر قفل الشاشة تلقائيًا عند الإخفاء
+    checkHealth();
+  });
 
-  const _origRecordLoop = recordLoop;
-  recordLoop = function(){ lastLoopAt = Date.now(); return _origRecordLoop(); };
-
-  async function startRecording(){
+  // ---------------- Keep screen on while recording ----------------
+  // iOS يقفل الشاشة بعد ثوانٍ فيتوقف الميكروفون والترجمة.
+  let wakeLock = null;
+  async function keepScreenOn(on){
+    // تطبيق iOS: يفعّل/يلغي القفل التلقائي (MainViewController.swift).
+    try { window.webkit.messageHandlers.keepAwake.postMessage(!!on); } catch(e){}
+    if (!('wakeLock' in navigator)) return;
     try {
-      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (on && !wakeLock) {
+        const lock = await navigator.wakeLock.request('screen');
+        if (!recording || wakeLock) { lock.release().catch(() => {}); return; }
+        wakeLock = lock;
+        lock.addEventListener('release', () => { if (wakeLock === lock) wakeLock = null; });
+      } else if (!on && wakeLock) {
+        const lock = wakeLock; wakeLock = null;
+        await lock.release();
+      }
+    } catch(e){}
+  }
+
+  let starting = false;
+  async function startRecording(){
+    if (recording || starting) return;
+    starting = true;
+    let s;
+    try {
+      s = await openMic();
     } catch (e) {
       showToast(UI_TEXT[uiLang].micDenied, 5000);
       return;
+    } finally {
+      starting = false;
     }
+    session++;
     recording = true;
+    mediaStream = s;
+    shownSeq = chunkSeq;
+    mutedSince = 0;
     mainBtn.classList.add('recording');
     mainBtn.textContent = '⏹️';
     mainBtnLabel.textContent = UI_TEXT[uiLang].mainBtnLabelStop;
     ccStage.classList.remove('idle');
     ccStage.innerHTML = '<span class="cc-badge"><span class="dot"></span>LIVE</span><div class="cc-line translated">…</div>';
+    keepScreenOn(true);
     recordLoop();
   }
 
   function stopRecording(){
+    session++;
     recording = false;
     if (chunkTimer) clearTimeout(chunkTimer);
-    try { if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop(); } catch(e){}
-    if (mediaStream) { mediaStream.getTracks().forEach((t) => t.stop()); mediaStream = null; }
+    const rec = mediaRecorder; mediaRecorder = null;
+    try { if (rec && rec.state !== 'inactive') rec.stop(); } catch(e){}
+    releaseMic();
+    keepScreenOn(false);
     mainBtn.classList.remove('recording');
     mainBtn.textContent = '🎤';
     mainBtnLabel.textContent = UI_TEXT[uiLang].mainBtnLabel;
