@@ -259,7 +259,9 @@ module.exports = async (req, res) => {
       translated = looksLikeRefusal ? original : raw;
       if (looksLikeRefusal) translationError = 'رفض النموذج الترجمة، تم عرض النص الأصلي';
     } else {
-      // Do NOT silently show the original text as if it were translated.
+      // v-no-fake-translate: لا نعرض النص الأصلي كأنه ترجمة — نُفرغ الترجمة
+      // ونُبلغ السبب صراحةً ليعرضه العميل.
+      translated = '';
       const errText = await chatRes.text().catch(() => '');
       translationError = chatRes.status === 429
         ? 'كل حسابات Groq المجانية وصلت حدها اليومي، حاول لاحقًا أو غدًا. / All free Groq accounts hit their daily limit, try again later or tomorrow.'
