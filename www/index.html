@@ -392,6 +392,7 @@
   let reopening = false;
   let lastLoopAt = 0;
   let chunkSeq = 0;         // ترتيب المقاطع المرسلة
+  let lastQuotaToast = 0;
   const CHUNK_MS = 3500;    // طول المقطع الثابت إذا لم يتوفر كشف الصوت
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -491,7 +492,10 @@
       }
       if (!resp.ok) {
         const data = await resp.json().catch(() => ({}));
-        if (resp.status !== 429) console.warn('caption error', data);
+        if (resp.status === 429) {
+          // رصيد Groq: نوضح السبب بدل ما يبدو التطبيق واقفًا (مرة كل 20 ثانية).
+          if (Date.now() - lastQuotaToast > 20000) { lastQuotaToast = Date.now(); showToast(data.error || 'Groq rate limit', 6000); }
+        } else console.warn('caption error', data);
         return;
       }
       const data = await resp.json();
