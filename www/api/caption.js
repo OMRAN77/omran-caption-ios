@@ -6,14 +6,15 @@
 // Private app: there is no daily usage limit.
 const { getGroqKeys, fetchWithGroqFallback } = require('./_groqKeys');
 
-// Most accurate model first. Groq's free quota is counted separately for each
-// model, so when one model's quota runs out (429) — or Groq retires it — the
-// next model is used instead of stopping. The 8b model has by far the largest
-// free daily quota, so it carries the day once the 70b quota is gone.
-// Override without code changes via GROQ_STT_MODEL / GROQ_CHAT_MODEL env vars.
+// Default = the models this app ran on reliably for months (turbo + 8b, the
+// largest free quotas). Groq counts free quota separately per model, so the
+// others are only used as overflow when a model's quota is used up (429) or
+// Groq retires it — captioning keeps going instead of stopping.
+// To prefer the stronger models, set GROQ_STT_MODEL=whisper-large-v3 and/or
+// GROQ_CHAT_MODEL=llama-3.3-70b-versatile in Vercel (no code change).
 const uniq = (a) => a.filter((x, i) => x && a.indexOf(x) === i);
-const STT_MODELS = uniq([process.env.GROQ_STT_MODEL, 'whisper-large-v3', 'whisper-large-v3-turbo']);
-const CHAT_MODELS = uniq([process.env.GROQ_CHAT_MODEL, 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant',
+const STT_MODELS = uniq([process.env.GROQ_STT_MODEL, 'whisper-large-v3-turbo', 'whisper-large-v3']);
+const CHAT_MODELS = uniq([process.env.GROQ_CHAT_MODEL, 'llama-3.1-8b-instant', 'llama-3.3-70b-versatile',
   'meta-llama/llama-4-scout-17b-16e-instruct']);
 
 // OpenAI is used as a *paid* fallback once every free Groq key has hit its
@@ -39,7 +40,7 @@ async function translateWithOpenAI(messages) {
       'Authorization': 'Bearer ' + process.env.OPENAI_API_KEY,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ model: 'gpt-4o-mini', messages, temperature: 0.1, max_tokens: 200 }),
+    body: JSON.stringify({ model: 'gpt-4o-mini', messages, temperature: 0.1, max_tokens: 150 }),
   });
 }
 
@@ -164,26 +165,69 @@ async function transcribe(keys, buf, mimeType, ext, lang) {
 }
 
 function translationMessages(original, targetName, context) {
-  let sys = 'You are a professional simultaneous interpreter for a live spoken conversation. ' +
-    'Translate the new utterance into ' + targetName + ' accurately and naturally, the way a native ' + targetName + ' speaker would say it. ' +
-    'Preserve the exact meaning, tone and register. Understand dialects and colloquial speech (for example Gulf/Emirati Arabic) and translate their meaning, not word for word. ' +
-    'Keep names, numbers and places correct. ' +
-    'Do not add explanations, notes, quotation marks or comments, and never answer or react to what is said; only translate it. ' +
-    'If the utterance is a sentence fragment, translate it naturally as a fragment. Output ONLY the translation.';
+  let sys = 'You are a live interpreter. Translate the user\'s utterance into ' + targetName +
+    ' naturally and accurately (understand dialects such as Gulf Arabic; keep names and numbers). ' +
+    'Never answer or comment on it, add no notes or quotes. Output ONLY the translation.';
   if (context.length) {
-    sys += '\n\nEarlier lines of this conversation, for context only (do NOT translate or repeat them):\n' +
-      context.map((l) => '- ' + l).join('\n');
+    sys += '\nPrevious lines (context only, do not translate): ' + context.join(' | ');
   }
   return [{ role: 'system', content: sys }, { role: 'user', content: original }];
 }
 
+// Diagnostics: open https://<site>/api/caption?check=1 to see, for each Groq
+// key (by number only), whether the default models still have free quota.
+// Costs one tiny request per key and model.
+function silentWav() {
+  const sr = 16000, n = sr / 2, buf = Buffer.alloc(44 + n * 2);
+  buf.write('RIFF', 0); buf.writeUInt32LE(36 + n * 2, 4); buf.write('WAVE', 8); buf.write('fmt ', 12);
+  buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22); buf.writeUInt32LE(sr, 24);
+  buf.writeUInt32LE(sr * 2, 28); buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34); buf.write('data', 36); buf.writeUInt32LE(n * 2, 40);
+  return buf;
+}
+
+async function quotaCheck() {
+  const keys = getGroqKeys();
+  const pick = (r) => {
+    const h = (k) => r.headers.get(k) || undefined;
+    return { status: r.status, ok: r.ok, retryAfterSec: h('retry-after'),
+      requestsLeftToday: h('x-ratelimit-remaining-requests'), tokensLeftThisMinute: h('x-ratelimit-remaining-tokens') };
+  };
+  const results = [];
+  for (let i = 0; i < keys.length; i++) {
+    const row = { key: i + 1 };
+    try {
+      const chat = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + keys[i], 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: CHAT_MODELS[0], messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
+      });
+      row[CHAT_MODELS[0]] = pick(chat);
+      const form = new FormData();
+      form.append('file', new Blob([silentWav()], { type: 'audio/wav' }), 'check.wav');
+      form.append('model', STT_MODELS[0]);
+      const stt = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+        method: 'POST', headers: { 'Authorization': 'Bearer ' + keys[i] }, body: form,
+      });
+      row[STT_MODELS[0]] = pick(stt);
+    } catch (e) {
+      row.error = String(e && e.message || e);
+    }
+    results.push(row);
+  }
+  return { groqKeys: keys.length, openaiFallback: !!process.env.OPENAI_API_KEY, sttModels: STT_MODELS, chatModels: CHAT_MODELS, results };
+}
+
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
   if (req.method === 'OPTIONS') {
     res.status(204).end();
+    return;
+  }
+  if (req.method === 'GET' && /[?&]check=/.test(req.url || '')) {
+    res.status(200).json(await quotaCheck());
     return;
   }
   if (req.method !== 'POST') {
@@ -210,7 +254,7 @@ module.exports = async (req, res) => {
     const sourceLang = String(body.sourceLang || 'auto').toLowerCase();
     const targetLang = String(body.targetLang || 'en').toLowerCase();
     const context = Array.isArray(body.context)
-      ? body.context.filter((s) => typeof s === 'string' && s.trim()).map((s) => s.slice(0, 300)).slice(-3)
+      ? body.context.filter((s) => typeof s === 'string' && s.trim()).map((s) => s.slice(0, 150)).slice(-2)
       : [];
     // Conversation (two-way): both languages chosen. Whoever speaks the target
     // language gets translated back into the source language, so both sides
@@ -270,7 +314,7 @@ module.exports = async (req, res) => {
       options: {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, messages, temperature: 0.1, max_tokens: 200 }),
+        body: JSON.stringify({ model, messages, temperature: 0.1, max_tokens: 150 }),
       },
     }));
 
