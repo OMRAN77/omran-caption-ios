@@ -495,7 +495,10 @@
         if (resp.status === 429) {
           // رصيد Groq: نوضح السبب بدل ما يبدو التطبيق واقفًا (مرة كل 20 ثانية).
           if (Date.now() - lastQuotaToast > 20000) { lastQuotaToast = Date.now(); showToast(data.error || 'Groq rate limit', 6000); }
-        } else console.warn('caption error', data);
+        } else if (Date.now() - lastQuotaToast > 20000) {
+          lastQuotaToast = Date.now();
+          showToast('⚠️ ' + (data.error || ('Server error ' + resp.status)).slice(0, 160), 6000);
+        }
         return;
       }
       const data = await resp.json();
@@ -548,12 +551,8 @@
       analyser = audioCtx.createAnalyser();
       analyser.fftSize = 1024;
       vadBuf = new Float32Array(analyser.fftSize);
-      // Safari لا يعالج العقد غير الموصولة بالمخرج؛ نوصلها بصوت صفر (لا يُسمع شيء).
-      const mute = audioCtx.createGain();
-      mute.gain.value = 0;
+      // لا نوصله بالسماعة: AnalyserNode يُعالج بدونها، وهكذا لا نغيّر جلسة الصوت في iOS.
       vadSource.connect(analyser);
-      analyser.connect(mute);
-      mute.connect(audioCtx.destination);
       vadAlive = false;
     } catch(e){ analyser = null; }
   }
@@ -565,7 +564,7 @@
     let sum = 0;
     for (let i = 0; i < vadBuf.length; i++) sum += vadBuf[i] * vadBuf[i];
     const rms = Math.sqrt(sum / vadBuf.length);
-    if (rms > 0) vadAlive = true;
+    if (rms > 0.003) vadAlive = true;
     return vadAlive ? rms : -1;
   }
 
@@ -650,9 +649,11 @@
       if (level >= 0) {
         usedVad = true;
         // العتبة تتكيف مع ضجيج المكان، وتبقى منخفضة لالتقاط المتكلم البعيد.
+        if (level < noiseFloor) noiseFloor += (level - noiseFloor) * 0.2;
+        else noiseFloor += (level - noiseFloor) * 0.002;
+        noiseFloor = Math.min(Math.max(noiseFloor, 0.0005), 0.02);
         const threshold = Math.max(0.004, noiseFloor * 2.5);
         if (level > threshold) { speechMs += TICK_MS; lastSpeechAt = now; }
-        else noiseFloor = noiseFloor * 0.97 + level * 0.03;
         const endOfPhrase = speechMs >= MIN_SPEECH_MS && now - lastSpeechAt >= PAUSE_MS && elapsed >= MIN_MS;
         const silentChunk = speechMs < MIN_SPEECH_MS && elapsed >= IDLE_MS;
         if (endOfPhrase || silentChunk || elapsed >= MAX_MS) return stopIt();

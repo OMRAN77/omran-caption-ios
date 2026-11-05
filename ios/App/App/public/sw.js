@@ -1,4 +1,4 @@
-const CACHE_NAME = 'omran-caption-v5';
+const CACHE_NAME = 'omran-caption-v6';
 const STATIC_ASSETS = [
   './',
   './index.html',
