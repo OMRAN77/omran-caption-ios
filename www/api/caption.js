@@ -6,12 +6,15 @@
 // Private app: there is no daily usage limit.
 const { getGroqKeys, fetchWithGroqFallback } = require('./_groqKeys');
 
-// Most accurate model first. The next one is used only if Groq rejects the
-// model itself (renamed/retired), so a model change never breaks the app.
+// Most accurate model first. Groq's free quota is counted separately for each
+// model, so when one model's quota runs out (429) — or Groq retires it — the
+// next model is used instead of stopping. The 8b model has by far the largest
+// free daily quota, so it carries the day once the 70b quota is gone.
 // Override without code changes via GROQ_STT_MODEL / GROQ_CHAT_MODEL env vars.
 const uniq = (a) => a.filter((x, i) => x && a.indexOf(x) === i);
 const STT_MODELS = uniq([process.env.GROQ_STT_MODEL, 'whisper-large-v3', 'whisper-large-v3-turbo']);
-const CHAT_MODELS = uniq([process.env.GROQ_CHAT_MODEL, 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant']);
+const CHAT_MODELS = uniq([process.env.GROQ_CHAT_MODEL, 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant',
+  'meta-llama/llama-4-scout-17b-16e-instruct']);
 
 // OpenAI is used as a *paid* fallback once every free Groq key has hit its
 // daily quota (HTTP 429), so live captioning never fully stops.
@@ -36,21 +39,50 @@ async function translateWithOpenAI(messages) {
       'Authorization': 'Bearer ' + process.env.OPENAI_API_KEY,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ model: 'gpt-4o-mini', messages, temperature: 0.1, max_tokens: 300 }),
+    body: JSON.stringify({ model: 'gpt-4o-mini', messages, temperature: 0.1, max_tokens: 200 }),
   });
 }
 
+// Models whose quota ran out on every key, until Groq's retry-after passes.
+// Lives as long as the warm serverless instance; saves a wasted call per key.
+const cooldownUntil = {};
+
+function retryAfterSec(res) {
+  const s = parseFloat(res && res.headers && res.headers.get('retry-after'));
+  return Number.isFinite(s) && s > 0 ? s : 60;
+}
+
 // Tries each model in turn (each with every Groq key). Moves to the next model
-// only when Groq says the model itself is unavailable.
+// when that model's quota is used up on all keys (429) or Groq says the model
+// itself is unavailable (400/404).
 async function groqWithModels(keys, models, build) {
+  const ready = models.filter((m) => !(cooldownUntil[m] > Date.now()));
+  const list = ready.length ? ready : models; // all cooling down: try anyway
   let res = null;
-  for (let i = 0; i < models.length; i++) {
-    ({ res } = await fetchWithGroqFallback(keys, (key) => build(key, models[i])));
-    if (res.ok || i === models.length - 1 || !(res.status === 400 || res.status === 404)) return res;
+  for (let i = 0; i < list.length; i++) {
+    const model = list[i];
+    ({ res } = await fetchWithGroqFallback(keys, (key) => build(key, model)));
+    if (res.ok) return res;
+    const last = i === list.length - 1;
+    if (res.status === 429) {
+      cooldownUntil[model] = Date.now() + Math.min(retryAfterSec(res), 3600) * 1000;
+      if (last) return res;
+      try { await res.body.cancel(); } catch (e) {}
+      continue;
+    }
+    if (last || !(res.status === 400 || res.status === 404)) return res;
     const errText = await res.clone().text().catch(() => '');
     if (!/model/i.test(errText)) return res;
   }
   return res;
+}
+
+// 429 from Groq is either the per-minute limit (short wait) or the daily free
+// quota (all keys, all models). Tell them apart so the message is accurate.
+function quotaMessage(res) {
+  return retryAfterSec(res) <= 120
+    ? 'ضغط مؤقت على Groq (حد الدقيقة)، يرجع خلال ثوانٍ. / Groq is briefly rate-limited, back in a few seconds.'
+    : 'خلص رصيد Groq المجاني لليوم في كل المفاتيح والموديلات. أضف مفتاح Groq آخر (GROQ_API_KEY_2) أو OPENAI_API_KEY في Vercel. / Free Groq quota used up for today on all keys and models.';
 }
 
 const LANG_NAMES = {
@@ -209,7 +241,7 @@ module.exports = async (req, res) => {
     if (!stt.res.ok) {
       const errText = await stt.res.text().catch(() => '');
       if (stt.res.status === 429) {
-        res.status(429).json({ error: 'كل حسابات Groq المجانية وصلت حدها اليومي، حاول لاحقًا أو غدًا. / All free Groq accounts hit their daily limit, try again later or tomorrow.' });
+        res.status(429).json({ error: quotaMessage(stt.res) });
         return;
       }
       res.status(stt.res.status).json({ error: 'Transcription error: ' + errText });
@@ -238,7 +270,7 @@ module.exports = async (req, res) => {
       options: {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, messages, temperature: 0.1, max_tokens: 300 }),
+        body: JSON.stringify({ model, messages, temperature: 0.1, max_tokens: 200 }),
       },
     }));
 
@@ -264,7 +296,7 @@ module.exports = async (req, res) => {
       translated = '';
       const errText = await chatRes.text().catch(() => '');
       translationError = chatRes.status === 429
-        ? 'كل حسابات Groq المجانية وصلت حدها اليومي، حاول لاحقًا أو غدًا. / All free Groq accounts hit their daily limit, try again later or tomorrow.'
+        ? quotaMessage(chatRes)
         : 'فشلت الترجمة (HTTP ' + chatRes.status + '): ' + errText.slice(0, 200);
     }
 
