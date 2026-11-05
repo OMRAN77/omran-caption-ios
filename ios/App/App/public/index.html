@@ -148,6 +148,13 @@
   }
   .cc-line.original{color:var(--muted);font-size:14px;}
   .cc-line.translated{color:var(--text);font-size:22px;font-weight:600;}
+  .cc-stage:not(.idle){justify-content:flex-start;max-height:58vh;overflow-y:auto;}
+  .cc-stage:not(.idle) > div:first-of-type{margin-top:auto;}
+  .cc-entry{display:flex;flex-direction:column;gap:2px;opacity:.5;transition:opacity .3s;}
+  .cc-entry.latest{opacity:1;}
+  .cc-entry:not(.latest) .cc-line.translated{font-size:16px;}
+  .cc-entry:not(.latest) .cc-line.original{font-size:12px;}
+  .cc-tag{font-size:10px;color:var(--accent2);font-weight:700;letter-spacing:.5px;direction:ltr;align-self:flex-start;}
   .cc-badge{
     position:absolute;top:10px;inset-inline-end:14px;
     font-size:10px;color:var(--muted);
@@ -385,9 +392,23 @@
   let reopening = false;
   let lastLoopAt = 0;
   let chunkSeq = 0;         // ترتيب المقاطع المرسلة
-  let shownSeq = 0;         // آخر مقطع عُرض (لا نعرض ردًا أقدم فوق أحدث)
-  const CHUNK_MS = 3500;
+  const CHUNK_MS = 3500;    // طول المقطع الثابت إذا لم يتوفر كشف الصوت
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // v-vad: نقطع التسجيل عند توقف المتكلم (نهاية الجملة) بدل كل 3.5 ثانية،
+  // فلا تنقطع الكلمات في النص ويفهم Whisper الجملة كاملة، ولا نرسل الصمت.
+  const MIN_MS = 1200;      // أقصر مقطع
+  const MAX_MS = 9000;      // أطول مقطع (حتى لا يتأخر النص إذا لم يتوقف المتكلم)
+  const PAUSE_MS = 700;     // سكوت بعد الكلام = نهاية الجملة
+  const IDLE_MS = 6000;     // مقطع صامت بالكامل: يُرمى ونبدأ من جديد
+  const MIN_SPEECH_MS = 250;
+  const TICK_MS = 50;
+  let audioCtx = null, analyser = null, vadSource = null, vadBuf = null;
+  let noiseFloor = 0.002, vadAlive = false;
+
+  // ---------------- Conversation view ----------------
+  const MAX_LINES = 4;
+  let lines = [];           // آخر سطور المحادثة {seq, original, translated, from, to}
 
   function showToast(msg, ms){
     const el = document.createElement('div');
@@ -414,12 +435,26 @@
     });
   }
 
-  function setStageLines(original, translated){
+  // نعرض آخر سطور المحادثة (الأحدث بالأسفل) بدل سطر واحد يتبدل كل ثوانٍ.
+  // الردود المتأخرة تدخل في مكانها حسب ترتيبها فلا تضيع جملة.
+  function addLine(entry){
+    lines.push(entry);
+    lines.sort((a, b) => a.seq - b.seq);
+    if (lines.length > MAX_LINES) lines = lines.slice(-MAX_LINES);
+    renderStage();
+  }
+
+  function renderStage(){
     ccStage.classList.remove('idle');
-    ccStage.innerHTML =
-      '<span class="cc-badge"><span class="dot"></span>LIVE</span>' +
-      (original ? '<div class="cc-line original">' + escapeHtml(original) + '</div>' : '') +
-      '<div class="cc-line translated">' + escapeHtml(translated || '…') + '</div>';
+    const body = lines.length ? lines.map((l, i) => {
+      const tag = (l.from && l.to && l.from !== l.to)
+        ? '<div class="cc-tag">' + escapeHtml(l.from.toUpperCase() + ' → ' + l.to.toUpperCase()) + '</div>' : '';
+      return '<div class="cc-entry' + (i === lines.length - 1 ? ' latest' : '') + '">' + tag +
+        (l.original && l.original !== l.translated ? '<div class="cc-line original" dir="auto">' + escapeHtml(l.original) + '</div>' : '') +
+        '<div class="cc-line translated" dir="auto">' + escapeHtml(l.translated || '…') + '</div></div>';
+    }).join('') : '<div class="cc-line translated">…</div>';
+    ccStage.innerHTML = '<span class="cc-badge"><span class="dot"></span>LIVE</span>' + body;
+    ccStage.scrollTop = ccStage.scrollHeight;
   }
 
   function escapeHtml(s){
@@ -428,26 +463,31 @@
 
   async function sendChunk(blob, mimeType, mySession){
     const seq = ++chunkSeq;
-    const stale = () => !recording || mySession !== session || seq < shownSeq;
     try {
       const audioBase64 = await blobToBase64(blob);
       if (!audioBase64 || mySession !== session) return;
-      const resp = await fetch(API_BASE + '/api/caption', {
+      const src = sourceSel.value, tgt = targetSel.value;
+      const post = () => fetch(API_BASE + '/api/caption', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           audioBase64, mimeType,
-          sourceLang: sourceSel.value,
-          targetLang: targetSel.value,
+          sourceLang: src,
+          targetLang: tgt,
+          // محادثة: إذا اخترت اللغتين، من يتكلم لغة الترجمة يُترجم كلامه للغتك.
+          twoWay: src !== 'auto',
+          // آخر الجمل تساعد المترجم يفهم سياق المحادثة.
+          context: lines.slice(-3).map((l) => l.original).filter(Boolean),
           guestId,
         }),
       });
+      let resp = await post();
       if (resp.status === 402) {
-        const data = await resp.json().catch(() => ({}));
-        if (mySession !== session) return;
-        showToast(data.error || 'Daily limit reached.', 6000);
-        stopRecording();
-        return;
+        // استخدام خاص بلا حد يومي. إذا كان الخادم ما زال يطبّق الحد القديم
+        // نبدّل المعرّف ونعيد نفس المقطع بدل إيقاف التسجيل.
+        guestId = genId();
+        localStorage.setItem('oc_guestId', guestId);
+        resp = await post();
       }
       if (!resp.ok) {
         const data = await resp.json().catch(() => ({}));
@@ -455,15 +495,15 @@
         return;
       }
       const data = await resp.json();
-      // الرد وصل بعد الإيقاف أو بعد رد أحدث منه: لا نكتب فوق الشاشة.
-      if (stale()) return;
-      shownSeq = seq;
+      // الرد وصل بعد الإيقاف: لا نكتب على الشاشة.
+      if (!recording || mySession !== session) return;
+      const from = data.detectedLang || '', to = data.toLang || '';
       // v-show-err: نعرض سبب فشل الترجمة إن وُجد بدل تجاهله (كان السيرفر
       // يرسله والعميل يهمله فيبدو النص عالقًا بلا تفسير).
       if (data.translationError) {
-        setStageLines(data.original, '⚠️ ' + data.translationError);
+        addLine({ seq, original: data.original, translated: '⚠️ ' + data.translationError, from, to });
       } else if (data.original || data.translated) {
-        setStageLines(data.original, data.translated);
+        addLine({ seq, original: data.original, translated: data.translated, from, to });
       }
     } catch (e) {
       // transient network hiccup; keep loop alive
@@ -481,7 +521,48 @@
     s.getAudioTracks().forEach((t) => t.addEventListener('ended', () => {
       if (recording && mediaStream === s) reopenMic();
     }));
+    attachVad(s);
     return s;
+  }
+
+  // ---------------- Voice activity detection ----------------
+  // يُستدعى داخل ضغطة الزر مباشرة (iOS يسمح بتشغيل الصوت فقط بعد لمسة المستخدم).
+  function ensureAudioCtx(){
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try {
+      if (!audioCtx) audioCtx = new AC();
+      if (audioCtx.state !== 'running') audioCtx.resume().catch(() => {});
+    } catch(e){ audioCtx = null; }
+  }
+
+  function attachVad(stream){
+    if (!audioCtx) return;
+    try {
+      if (vadSource) vadSource.disconnect();
+      vadSource = audioCtx.createMediaStreamSource(stream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      vadBuf = new Float32Array(analyser.fftSize);
+      // Safari لا يعالج العقد غير الموصولة بالمخرج؛ نوصلها بصوت صفر (لا يُسمع شيء).
+      const mute = audioCtx.createGain();
+      mute.gain.value = 0;
+      vadSource.connect(analyser);
+      analyser.connect(mute);
+      mute.connect(audioCtx.destination);
+      vadAlive = false;
+    } catch(e){ analyser = null; }
+  }
+
+  // مستوى الصوت الحالي (RMS)، أو -1 إذا كشف الصوت غير متاح فنرجع للمقاطع الثابتة.
+  function micLevel(){
+    if (!analyser || !audioCtx || audioCtx.state !== 'running') return -1;
+    analyser.getFloatTimeDomainData(vadBuf);
+    let sum = 0;
+    for (let i = 0; i < vadBuf.length; i++) sum += vadBuf[i] * vadBuf[i];
+    const rms = Math.sqrt(sum / vadBuf.length);
+    if (rms > 0) vadAlive = true;
+    return vadAlive ? rms : -1;
   }
 
   function releaseMic(){
@@ -530,6 +611,8 @@
     if (!streamAlive()) { reopenMic(); return; }
     const mySession = session;
     const mimeType = pickMime();
+    const startedAt = Date.now();
+    let usedVad = false, speechMs = 0, lastSpeechAt = 0;
     let recorder;
     try {
       recorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : undefined);
@@ -537,9 +620,10 @@
       const chunks = [];
       recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
       recorder.onstop = () => {
-        // مقطع صامت لأن iOS كتم الميكروفون (مكالمة/خلفية): لا نرسله ولا نستهلك الحد اليومي.
+        // مقطع صامت (لا كلام، أو iOS كتم الميكروفون في مكالمة/خلفية): لا نرسله.
         const muted = !mediaStream || mediaStream.getAudioTracks().every((t) => t.muted);
-        if (mySession === session && chunks.length && !muted) {
+        const hadSpeech = !usedVad || speechMs >= MIN_SPEECH_MS;
+        if (mySession === session && chunks.length && !muted && hadSpeech) {
           const type = mimeType || recorder.mimeType || 'audio/webm';
           sendChunk(new Blob(chunks, { type }), type, mySession);
         }
@@ -553,7 +637,27 @@
       reopenMic();
       return;
     }
-    chunkTimer = setTimeout(() => { try { if (recorder.state !== 'inactive') recorder.stop(); } catch(e){} }, CHUNK_MS);
+    const stopIt = () => { try { if (recorder.state !== 'inactive') recorder.stop(); } catch(e){} };
+    // كل 50ms: هل يتكلم أحد؟ نقطع عند أول سكتة بعد الكلام (نهاية الجملة).
+    const tick = () => {
+      if (recorder.state === 'inactive' || recorder !== mediaRecorder) return;
+      const now = Date.now(), elapsed = now - startedAt;
+      const level = micLevel();
+      if (level >= 0) {
+        usedVad = true;
+        // العتبة تتكيف مع ضجيج المكان، وتبقى منخفضة لالتقاط المتكلم البعيد.
+        const threshold = Math.max(0.004, noiseFloor * 2.5);
+        if (level > threshold) { speechMs += TICK_MS; lastSpeechAt = now; }
+        else noiseFloor = noiseFloor * 0.97 + level * 0.03;
+        const endOfPhrase = speechMs >= MIN_SPEECH_MS && now - lastSpeechAt >= PAUSE_MS && elapsed >= MIN_MS;
+        const silentChunk = speechMs < MIN_SPEECH_MS && elapsed >= IDLE_MS;
+        if (endOfPhrase || silentChunk || elapsed >= MAX_MS) return stopIt();
+      } else if (elapsed >= CHUNK_MS) {
+        return stopIt(); // بدون كشف صوت: مقاطع ثابتة كالسابق
+      }
+      chunkTimer = setTimeout(tick, TICK_MS);
+    };
+    chunkTimer = setTimeout(tick, TICK_MS);
   }
 
   // فحص دوري + عند الرجوع للتطبيق: يعيد الميكروفون أو الحلقة إن تعطّلت،
@@ -565,7 +669,9 @@
     const muted = mediaStream.getAudioTracks().every((t) => t.muted);
     mutedSince = muted ? (mutedSince || Date.now()) : 0;
     if (muted && Date.now() - mutedSince > 8000) { mutedSince = 0; reopenMic(); return; }
-    if (Date.now() - lastLoopAt > CHUNK_MS * 3) {
+    // iOS يوقف AudioContext بعد المقاطعات؛ نعيد تشغيله لكشف الكلام.
+    if (audioCtx && audioCtx.state !== 'running') audioCtx.resume().catch(() => {});
+    if (Date.now() - lastLoopAt > MAX_MS + 5000) {
       const stuck = mediaRecorder; mediaRecorder = null;
       try { if (stuck && stuck.state !== 'inactive') stuck.stop(); } catch(e){}
       recordLoop();
@@ -602,6 +708,7 @@
   async function startRecording(){
     if (recording || starting) return;
     starting = true;
+    ensureAudioCtx();
     let s;
     try {
       s = await openMic();
@@ -614,7 +721,8 @@
     session++;
     recording = true;
     mediaStream = s;
-    shownSeq = chunkSeq;
+    lines = [];
+    noiseFloor = 0.002;
     mutedSince = 0;
     mainBtn.classList.add('recording');
     mainBtn.textContent = '⏹️';
@@ -632,6 +740,8 @@
     const rec = mediaRecorder; mediaRecorder = null;
     try { if (rec && rec.state !== 'inactive') rec.stop(); } catch(e){}
     releaseMic();
+    if (vadSource) { try { vadSource.disconnect(); } catch(e){} vadSource = null; analyser = null; }
+    if (audioCtx && audioCtx.state === 'running') audioCtx.suspend().catch(() => {});
     keepScreenOn(false);
     mainBtn.classList.remove('recording');
     mainBtn.textContent = '🎤';
