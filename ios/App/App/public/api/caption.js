@@ -6,16 +6,58 @@
 // Private app: there is no daily usage limit.
 const { getGroqKeys, fetchWithGroqFallback } = require('./_groqKeys');
 
-// Default = the models this app ran on reliably for months (turbo + 8b, the
-// largest free quotas). Groq counts free quota separately per model, so the
-// others are only used as overflow when a model's quota is used up (429) or
-// Groq retires it — captioning keeps going instead of stopping.
-// To prefer the stronger models, set GROQ_STT_MODEL=whisper-large-v3 and/or
-// GROQ_CHAT_MODEL=llama-3.3-70b-versatile in Vercel (no code change).
+// Groq retires models over time (llama-3.1-8b-instant started returning 404),
+// so model names are a preference list, not a hard dependency: the server asks
+// Groq which models this account actually has and uses the first available one.
+// Groq counts free quota separately per model, so the next one also takes over
+// when a model's quota is used up (429).
+// Force a model with GROQ_STT_MODEL / GROQ_CHAT_MODEL in Vercel (no code change).
 const uniq = (a) => a.filter((x, i) => x && a.indexOf(x) === i);
 const STT_MODELS = uniq([process.env.GROQ_STT_MODEL, 'whisper-large-v3-turbo', 'whisper-large-v3']);
-const CHAT_MODELS = uniq([process.env.GROQ_CHAT_MODEL, 'llama-3.1-8b-instant', 'llama-3.3-70b-versatile',
-  'meta-llama/llama-4-scout-17b-16e-instruct']);
+const CHAT_MODELS = uniq([process.env.GROQ_CHAT_MODEL,
+  'llama-3.1-8b-instant', 'llama-3.3-70b-versatile',
+  'meta-llama/llama-4-scout-17b-16e-instruct', 'meta-llama/llama-4-maverick-17b-128e-instruct',
+  'moonshotai/kimi-k2-instruct', 'openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'qwen/qwen3-32b']);
+// Never used for translation (speech, safety classifiers, tool agents, TTS).
+const NOT_CHAT = /whisper|tts|guard|playai|orpheus|compound|distil|safeguard/i;
+
+// Which models this account can use right now (GET /models), cached 1 hour.
+let modelIdsCache = { at: 0, ids: null };
+async function groqModelIds(keys) {
+  const age = Date.now() - modelIdsCache.at;
+  if (modelIdsCache.ids && age < 3600 * 1000) return modelIdsCache.ids;
+  if (!modelIdsCache.ids && age < 10 * 60 * 1000) return null; // listing failed recently
+  for (const key of keys) {
+    try {
+      const r = await fetch('https://api.groq.com/openai/v1/models', { headers: { 'Authorization': 'Bearer ' + key } });
+      if (!r.ok) continue;
+      const j = await r.json();
+      const ids = (Array.isArray(j.data) ? j.data : []).filter((m) => m && m.id && m.active !== false).map((m) => m.id);
+      if (ids.length) { modelIdsCache = { at: Date.now(), ids }; return ids; }
+    } catch (e) {}
+  }
+  modelIdsCache = { at: Date.now(), ids: null };
+  return null; // unknown: fall back to trying the preference list
+}
+
+// Preference order, limited to what exists; if none of our names exist any
+// more, any text model Groq offers is used rather than failing.
+async function availableModels(keys, preferred, kind) {
+  const ids = await groqModelIds(keys);
+  if (!ids) return preferred;
+  const have = preferred.filter((m) => ids.includes(m));
+  if (kind === 'stt') return have.length ? have : preferred;
+  const others = ids.filter((id) => !have.includes(id) && !NOT_CHAT.test(id));
+  return have.concat(others).length ? have.concat(others) : preferred;
+}
+
+// Reasoning models need room to think and must not print their thoughts.
+function chatBody(model, messages) {
+  const body = { model, messages, temperature: 0.1, max_tokens: 150 };
+  if (/gpt-oss/i.test(model)) { body.reasoning_effort = 'low'; body.max_tokens = 1024; }
+  if (/qwen3|deepseek-r1/i.test(model)) { body.reasoning_format = 'hidden'; body.max_tokens = 1024; }
+  return body;
+}
 
 // OpenAI is used as a *paid* fallback once every free Groq key has hit its
 // daily quota (HTTP 429), so live captioning never fully stops.
@@ -34,14 +76,19 @@ async function transcribeWithOpenAI(buf, mimeType, ext, lang) {
 }
 
 async function translateWithOpenAI(messages) {
-  return fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': 'Bearer ' + process.env.OPENAI_API_KEY,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ model: 'gpt-4o-mini', messages, temperature: 0.1, max_tokens: 150 }),
-  });
+  let r = null;
+  for (const model of ['gpt-4o-mini', 'gpt-4.1-mini']) {
+    r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + process.env.OPENAI_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ model, messages, temperature: 0.1, max_completion_tokens: 150 }),
+    });
+    if (r.status !== 404) return r;
+  }
+  return r;
 }
 
 // Models whose quota ran out on every key, until Groq's retry-after passes.
@@ -74,6 +121,8 @@ async function groqWithModels(keys, models, build) {
     if (last || !(res.status === 400 || res.status === 404)) return res;
     const errText = await res.clone().text().catch(() => '');
     if (!/model/i.test(errText)) return res;
+    // Model missing/retired for this account: skip it for a day.
+    cooldownUntil[model] = Date.now() + 24 * 3600 * 1000;
   }
   return res;
 }
@@ -116,7 +165,7 @@ const HALLUCINATION_PATTERNS = [
 ];
 
 async function transcribe(keys, buf, mimeType, ext, lang) {
-  let res = await groqWithModels(keys, STT_MODELS, (key, model) => {
+  let res = await groqWithModels(keys, await availableModels(keys, STT_MODELS, 'stt'), (key, model) => {
     // A fresh form per attempt (bodies are not reused across fetches).
     const form = new FormData();
     form.append('file', new Blob([buf], { type: mimeType || 'audio/webm' }), 'audio.' + ext);
@@ -185,8 +234,20 @@ function silentWav() {
   return buf;
 }
 
+function groqKeyNames() {
+  const names = [];
+  if (process.env.GROQ_API_KEY) names.push('GROQ_API_KEY');
+  for (let i = 2; i <= 9; i++) if (process.env['GROQ_API_KEY_' + i]) names.push('GROQ_API_KEY_' + i);
+  return names;
+}
+
 async function quotaCheck() {
   const keys = getGroqKeys();
+  const names = groqKeyNames();
+  modelIdsCache = { at: 0, ids: null }; // fresh list for the check
+  const ids = await groqModelIds(keys);
+  const chatList = await availableModels(keys, CHAT_MODELS, 'chat');
+  const sttList = await availableModels(keys, STT_MODELS, 'stt');
   const pick = (r) => {
     const h = (k) => r.headers.get(k) || undefined;
     return { status: r.status, ok: r.ok, retryAfterSec: h('retry-after'),
@@ -194,27 +255,39 @@ async function quotaCheck() {
   };
   const results = [];
   for (let i = 0; i < keys.length; i++) {
-    const row = { key: i + 1 };
+    const row = { key: i + 1, env: names[i] };
     try {
       const chat = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + keys[i], 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: CHAT_MODELS[0], messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
+        body: JSON.stringify(chatBody(chatList[0], [{ role: 'user', content: 'hi' }])),
       });
-      row[CHAT_MODELS[0]] = pick(chat);
+      row[chatList[0]] = pick(chat);
       const form = new FormData();
       form.append('file', new Blob([silentWav()], { type: 'audio/wav' }), 'check.wav');
-      form.append('model', STT_MODELS[0]);
+      form.append('model', sttList[0]);
       const stt = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
         method: 'POST', headers: { 'Authorization': 'Bearer ' + keys[i] }, body: form,
       });
-      row[STT_MODELS[0]] = pick(stt);
+      row[sttList[0]] = pick(stt);
     } catch (e) {
       row.error = String(e && e.message || e);
     }
     results.push(row);
   }
-  return { groqKeys: keys.length, openaiFallback: !!process.env.OPENAI_API_KEY, sttModels: STT_MODELS, chatModels: CHAT_MODELS, results };
+  let openai = 'not set';
+  if (process.env.OPENAI_API_KEY) {
+    try {
+      const r = await fetch('https://api.openai.com/v1/models', { headers: { 'Authorization': 'Bearer ' + process.env.OPENAI_API_KEY } });
+      openai = r.ok ? 'ok' : 'HTTP ' + r.status;
+    } catch (e) { openai = 'error'; }
+  }
+  return {
+    groqKeys: keys.length, openaiFallback: openai,
+    translationModels: chatList.slice(0, 5), sttModels: sttList,
+    groqTextModelsAvailable: ids ? ids.filter((id) => !NOT_CHAT.test(id)) : 'could not list',
+    results,
+  };
 }
 
 module.exports = async (req, res) => {
@@ -309,25 +382,29 @@ module.exports = async (req, res) => {
 
     const targetName = LANG_NAMES[toLang] || toLang || 'English';
     const messages = translationMessages(original, targetName, context);
-    let chatRes = await groqWithModels(groqKeys, CHAT_MODELS, (key, model) => ({
+    let chatRes = await groqWithModels(groqKeys, await availableModels(groqKeys, CHAT_MODELS, 'chat'), (key, model) => ({
       url: 'https://api.groq.com/openai/v1/chat/completions',
       options: {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, messages, temperature: 0.1, max_tokens: 150 }),
+        body: JSON.stringify(chatBody(model, messages)),
       },
     }));
 
-    if (!chatRes.ok && chatRes.status === 429 && process.env.OPENAI_API_KEY) {
-      // Same daily-quota fallback for the translation step.
+    if (!chatRes.ok && process.env.OPENAI_API_KEY) {
+      // Groq could not translate (quota, retired models, outage): use the
+      // owner's OpenAI key so translation never stops.
+      const groqRes = chatRes;
       chatRes = await translateWithOpenAI(messages);
+      if (!chatRes.ok) chatRes = groqRes; // report Groq's reason if OpenAI fails too
     }
 
     let translated = original;
     let translationError = '';
     if (chatRes.ok) {
       const chatData = await chatRes.json();
-      const raw = (chatData.choices && chatData.choices[0] && chatData.choices[0].message && chatData.choices[0].message.content || '').trim();
+      const raw = (chatData.choices && chatData.choices[0] && chatData.choices[0].message && chatData.choices[0].message.content || '')
+        .replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
       // Guard against the model refusing or commenting instead of translating
       // (e.g. "No text was provided for translation.") — fall back to showing
       // the original text rather than a confusing meta-message.
